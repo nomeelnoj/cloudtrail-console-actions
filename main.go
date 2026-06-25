@@ -55,7 +55,35 @@ func Handler(ctx context.Context, event handler.Event) error {
 	return nil
 }
 
+// eventTimeAfter reports whether CloudTrail eventTime a is later than b.
+// eventTime is RFC3339; it falls back to lexical comparison if parsing fails.
+func eventTimeAfter(a, b string) bool {
+	ta, errA := time.Parse(time.RFC3339, a)
+	tb, errB := time.Parse(time.RFC3339, b)
+	if errA == nil && errB == nil {
+		return ta.After(tb)
+	}
+	return a > b
+}
+
 func FilterRecords(logFile *CloudTrailFile, eventRecord handler.Record) error {
+	type slackEvent struct {
+		count       int
+		slackName   string
+		eventName   string
+		eventSource string
+		errorCode   string
+		userName    string
+		awsRegion   string
+		eventID     string
+		eventTime   string
+	}
+	// Aggregate identical console actions within a single log file so that
+	// repeated events (e.g. DeleteObject fired many times) post once as
+	// "Nx <action>" instead of flooding Slack with one message each.
+	slackEvents := map[string]*slackEvent{}
+	var slackOrder []string
+
 	for _, record := range logFile.Records {
 		userIdentity, _ := record["userIdentity"].(map[string]interface{})
 
@@ -243,11 +271,20 @@ func FilterRecords(logFile *CloudTrailFile, eventRecord handler.Record) error {
 				}
 			}
 
-		// elasticfilesystem.amazonaws.com
+		// elasticfilesystem.amazonaws.com / s3files.amazonaws.com
 		case en == "NewClientConnection":
 			if record["eventSource"] == "elasticfilesystem.amazonaws.com" {
 				// We continue to get rate limited by slack for ANONYMOUS_PRINCIPAL's
 				// if userName != "" { continue } // ANONYMOUS_PRINCIPAL
+				continue
+			}
+			if record["eventSource"] == "s3files.amazonaws.com" {
+				continue
+			}
+
+		// ssm-guiconnect.amazonaws.com
+		case en == "StartConnection":
+			if record["eventSource"] == "ssm-guiconnect.amazonaws.com" {
 				continue
 			}
 
@@ -452,12 +489,58 @@ func FilterRecords(logFile *CloudTrailFile, eventRecord handler.Record) error {
 			"s3_uri":       fmt.Sprintf("s3://%s/%s", eventRecord.S3.Bucket.Name, eventRecord.S3.Object.Key),
 		}).Info("Event")
 
-		if webhookUrl, ok := os.LookupEnv("SLACK_WEBHOOK"); ok {
+		if _, ok := os.LookupEnv("SLACK_WEBHOOK"); ok {
 			slackName := getEnv(
 				fmt.Sprintf("SLACK_NAME_%s", userIdentity["accountId"]),
 				getEnv("SLACK_NAME", fmt.Sprintf("%s", recordAccount)),
 			)
-			slackBody := fmt.Sprintf(`
+			eventName := fmt.Sprintf("%s", record["eventName"])
+			eventSource := fmt.Sprintf("%s", record["eventSource"])
+			// Identical action/source/user/account/error pairs collapse into
+			// a single notification with a leading count multiple.
+			key := strings.Join([]string{eventName, eventSource, userName, slackName, errorCode}, "|")
+			if ev, ok := slackEvents[key]; ok {
+				ev.count++
+				// Point the deep-link at the most recent occurrence in this
+				// batch so the message lands on the latest matching event.
+				recordTime := fmt.Sprintf("%s", record["eventTime"])
+				if eventTimeAfter(recordTime, ev.eventTime) {
+					ev.awsRegion = fmt.Sprintf("%s", record["awsRegion"])
+					ev.eventID = fmt.Sprintf("%s", record["eventID"])
+					ev.eventTime = recordTime
+				}
+			} else {
+				slackEvents[key] = &slackEvent{
+					count:       1,
+					slackName:   slackName,
+					eventName:   eventName,
+					eventSource: eventSource,
+					errorCode:   errorCode,
+					userName:    userName,
+					awsRegion:   fmt.Sprintf("%s", record["awsRegion"]),
+					eventID:     fmt.Sprintf("%s", record["eventID"]),
+					eventTime:   fmt.Sprintf("%s", record["eventTime"]),
+				}
+				slackOrder = append(slackOrder, key)
+			}
+		}
+	}
+
+	webhookUrl, ok := os.LookupEnv("SLACK_WEBHOOK")
+	if !ok {
+		// log.Infof("Scanned %d records", len(logFile.Records))
+		return nil
+	}
+
+	for _, key := range slackOrder {
+		ev := slackEvents[key]
+		// Prefix the count multiple in front of the action when it repeats,
+		// e.g. "2x DeleteObject". The entire section line is bolded.
+		action := ev.eventName
+		if ev.count > 1 {
+			action = fmt.Sprintf("%dx %s", ev.count, ev.eventName)
+		}
+		slackBody := fmt.Sprintf(`
 {
   "channel": "%s",
   "text": "%s | %s | %s",
@@ -466,7 +549,7 @@ func FilterRecords(logFile *CloudTrailFile, eventRecord handler.Record) error {
       "type": "section",
       "text": {
         "type": "mrkdwn",
-        "text": "*%s* - %s%s"
+        "text": "*%s - %s%s*"
       }
     },
     {
@@ -489,24 +572,23 @@ func FilterRecords(logFile *CloudTrailFile, eventRecord handler.Record) error {
   ]
 }
 `,
-				os.Getenv("SLACK_CHANNEL"),
-				slackName,
-				record["eventName"],
-				userName,
-				record["eventName"],
-				record["eventSource"],
-				errorCode,
-				slackName,
-				userName,
-				record["awsRegion"],
-				record["eventID"],
-				record["eventTime"])
+			os.Getenv("SLACK_CHANNEL"),
+			ev.slackName,
+			action,
+			ev.userName,
+			action,
+			ev.eventSource,
+			ev.errorCode,
+			ev.slackName,
+			ev.userName,
+			ev.awsRegion,
+			ev.eventID,
+			ev.eventTime)
 
-			err := SendSlackNotification(webhookUrl, []byte(slackBody))
-			if err != nil {
-				log.Debugln(slackBody)
-				log.Debug(err)
-			}
+		err := SendSlackNotification(webhookUrl, []byte(slackBody))
+		if err != nil {
+			log.Debugln(slackBody)
+			log.Debug(err)
 		}
 	}
 	// log.Infof("Scanned %d records", len(logFile.Records))
